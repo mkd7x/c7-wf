@@ -128,8 +128,14 @@ def check_assertions(
             for expr in expect_json_keys:
                 if "=" in expr:
                     key, expected_val = expr.split("=", 1)
-                    actual_val = str(res["json"].get(key.strip()))
-                    if actual_val != expected_val.strip():
+                    actual_raw = res["json"].get(key.strip())
+                    actual_val = str(actual_raw)
+                    expected_str = expected_val.strip()
+                    if isinstance(actual_raw, bool):
+                        matches = actual_val.lower() == expected_str.lower()
+                    else:
+                        matches = actual_val == expected_str
+                    if not matches:
                         failures.append(
                             f"JSON key '{key}' had value '{actual_val}', expected '{expected_val}'."
                         )
