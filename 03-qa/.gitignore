@@ -28,3 +28,6 @@ tmp/
 temp/
 runs/*
 !runs/.gitkeep
+
+# Exclude target-specific workflows
+workflows/todo-api/
