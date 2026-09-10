@@ -10,6 +10,7 @@ import sys
 import os
 import re
 import json
+import ssl
 import time
 import argparse
 import urllib.request
@@ -23,12 +24,41 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import audit_logger
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib handler that surfaces 3xx responses instead of following them."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener(no_redirect: bool = False, insecure: bool = False,
+                 ca_cert: Optional[str] = None) -> "urllib.request.OpenerDirector":
+    """Build a urlopen-compatible opener with redirect/TLS policy applied."""
+    handlers: list = []
+    if no_redirect:
+        handlers.append(NoRedirectHandler())
+    if ca_cert:
+        handlers.append(urllib.request.HTTPSHandler(
+            context=ssl.create_default_context(cafile=ca_cert)))
+    elif insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    if not handlers:
+        return urllib.request.build_opener()
+    return urllib.request.build_opener(*handlers)
+
+
 def send_request(
     url: str,
     method: str = "GET",
     headers: Optional[Dict[str, str]] = None,
     data: Optional[str] = None,
-    timeout: int = 30
+    timeout: int = 30,
+    no_redirect: bool = False,
+    insecure: bool = False,
+    ca_cert: Optional[str] = None
 ) -> Dict[str, Any]:
     """Execute HTTP request and return timing, status, headers, and body."""
     method = method.upper()
@@ -54,8 +84,9 @@ def send_request(
     )
 
     start_time = time.time()
+    opener = build_opener(no_redirect=no_redirect, insecure=insecure, ca_cert=ca_cert)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with opener.open(req, timeout=timeout) as response:
             duration_ms = round((time.time() - start_time) * 1000, 2)
             status_code = response.status
             resp_headers = dict(response.headers)
@@ -74,7 +105,9 @@ def send_request(
                 "headers": resp_headers,
                 "body": body_text,
                 "json": json_data,
-                "error": None
+                "error": None,
+                "final_url": response.geturl(),
+                "redirected": response.geturl() != url,
             }
     except urllib.error.HTTPError as e:
         duration_ms = round((time.time() - start_time) * 1000, 2)
@@ -83,6 +116,11 @@ def send_request(
             json_data = json.loads(body_text)
         except Exception:
             json_data = None
+        location = None
+        try:
+            location = e.headers.get("Location")
+        except Exception:
+            location = None
         return {
             "success": False,
             "status_code": e.code,
@@ -90,7 +128,10 @@ def send_request(
             "headers": dict(e.headers),
             "body": body_text,
             "json": json_data,
-            "error": f"HTTPError: {e.reason}"
+            "error": f"HTTPError: {e.reason}",
+            "final_url": getattr(e, "url", url) or url,
+            "redirected": False,
+            "location": location,
         }
     except Exception as e:
         duration_ms = round((time.time() - start_time) * 1000, 2)
@@ -101,7 +142,9 @@ def send_request(
             "headers": {},
             "body": "",
             "json": None,
-            "error": str(e)
+            "error": str(e),
+            "final_url": url,
+            "redirected": False,
         }
 
 
@@ -249,6 +292,11 @@ def main():
     parser.add_argument("--expect-contains", action="append", help="Assert that response body contains string")
     parser.add_argument("--expect-json", action="append", help="Assert JSON path (e.g. 'id=3', 'items[0].title=foo', 'items.length>=1')")
     parser.add_argument("--save", help="Save response body to specified file path")
+    parser.add_argument("--no-redirect", action="store_true",
+                        help="Do not follow HTTP redirects; assert the 3xx response directly")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Skip TLS certificate verification (self-signed dev certs)")
+    parser.add_argument("--ca-cert", help="Path to a custom CA bundle for TLS verification")
     parser.add_argument("--step-id", help="Logical identifier for workflow step audit logging (e.g. 'step-05-create-list')")
     parser.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print request and response headers")
@@ -275,13 +323,20 @@ def main():
 
     expected_statuses = [int(s.strip()) for s in args.expect_status.split(",")] if args.expect_status else None
 
+    if args.ca_cert and args.insecure:
+        print("[!] --ca-cert and --insecure are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
     # Execute request
     res = send_request(
         url=args.url,
         method=args.method,
         headers=headers,
         data=data,
-        timeout=args.timeout
+        timeout=args.timeout,
+        no_redirect=args.no_redirect,
+        insecure=args.insecure,
+        ca_cert=args.ca_cert
     )
 
     if args.verbose:
@@ -319,8 +374,11 @@ def main():
         else:
             print(res["body"].strip())
 
-    # Record to live audit log
-    step_status = "FAIL" if failures or not res["success"] else "PASS"
+    # Record to live audit log.
+    # A non-2xx response is only a failure when it was unexpected (assertions failed) or when the
+    # step declared no expectations at all. This keeps intentional 4xx/5xx regression checks PASS.
+    assertions_provided = bool(expected_statuses or args.expect_contains or args.expect_json)
+    step_status = "FAIL" if failures or (not assertions_provided and not res["success"]) else "PASS"
     audit_logger.record_step(
         tool="send_http_req",
         step_id=args.step_id,
@@ -328,13 +386,17 @@ def main():
             "url": args.url,
             "method": args.method,
             "headers": headers,
-            "data": data
+            "data": data,
+            "no_redirect": args.no_redirect,
         },
         output_data={
             "status_code": res["status_code"],
             "duration_ms": res["duration_ms"],
             "headers": res["headers"],
-            "body": res["json"] if res["json"] is not None else res["body"]
+            "body": res["json"] if res["json"] is not None else res["body"],
+            "final_url": res.get("final_url"),
+            "redirected": res.get("redirected", False),
+            "location": res.get("location") or res["headers"].get("Location") or res["headers"].get("location"),
         },
         assertions={
             "expected_status": expected_statuses,

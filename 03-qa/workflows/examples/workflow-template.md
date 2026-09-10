@@ -46,8 +46,8 @@ python3 tools/run_sql_cmd.py \
 
 ### Step 4: Start Application & Poll Health
 ```bash
-# 1. Start application in background
-python3 tools/qa_runner.py exec --cmd "[START_COMMAND] &"
+# 1. Start application in background (redirect so the launcher never blocks)
+python3 tools/qa_runner.py exec --cmd "[START_COMMAND] > /tmp/app.log 2>&1 &" --step-id step-04-app-start
 
 # 2. Wait for healthcheck with audit logging
 python3 tools/wait_for_service.py \

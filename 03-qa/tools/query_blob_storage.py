@@ -44,37 +44,42 @@ def list_local_blobs(bucket_dir: Path, prefix: str = "") -> List[Dict[str, Any]]
 
 
 def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--step-id", help="Logical identifier for workflow step audit logging")
+    common.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
+
     parser = argparse.ArgumentParser(description="Clean Room Blob & Object Storage Query CLI")
+    # Root-level flags keep working when placed before the subcommand.
     parser.add_argument("--step-id", help="Logical identifier for workflow step audit logging")
     parser.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
 
     subparsers = parser.add_subparsers(dest="action", help="Storage action")
 
     # list
-    p_list = subparsers.add_parser("list", help="List objects in storage bucket/directory")
+    p_list = subparsers.add_parser("list", help="List objects in storage bucket/directory", parents=[common])
     p_list.add_argument("--dir", "-d", required=True, help="Path to local bucket/blob directory")
     p_list.add_argument("--prefix", "-p", default="", help="Filter by key prefix")
     p_list.add_argument("--json", action="store_true", help="Output JSON format")
 
     # exists
-    p_exists = subparsers.add_parser("exists", help="Check if an object exists in storage")
+    p_exists = subparsers.add_parser("exists", help="Check if an object exists in storage", parents=[common])
     p_exists.add_argument("--dir", "-d", required=True, help="Path to local bucket/blob directory")
     p_exists.add_argument("--key", "-k", required=True, help="Object key name")
 
     # get
-    p_get = subparsers.add_parser("get", help="Retrieve blob content")
+    p_get = subparsers.add_parser("get", help="Retrieve blob content", parents=[common])
     p_get.add_argument("--dir", "-d", required=True, help="Path to local bucket/blob directory")
     p_get.add_argument("--key", "-k", required=True, help="Object key name")
     p_get.add_argument("--out", "-o", help="File to write blob content to")
 
     # put
-    p_put = subparsers.add_parser("put", help="Upload a file as a blob")
+    p_put = subparsers.add_parser("put", help="Upload a file as a blob", parents=[common])
     p_put.add_argument("--dir", "-d", required=True, help="Path to local bucket/blob directory")
     p_put.add_argument("--key", "-k", required=True, help="Object key name")
     p_put.add_argument("--file", "-f", required=True, help="Source file to upload")
 
     # delete
-    p_del = subparsers.add_parser("delete", help="Delete a blob")
+    p_del = subparsers.add_parser("delete", help="Delete a blob", parents=[common])
     p_del.add_argument("--dir", "-d", required=True, help="Path to local bucket/blob directory")
     p_del.add_argument("--key", "-k", required=True, help="Object key name")
 
@@ -87,7 +92,7 @@ def main():
     start_time = time.time()
     bucket_path = Path(args.dir).resolve()
     failures = []
-    output_info = {}
+    output_info: Dict[str, Any] = {}
 
     if args.action == "list":
         blobs = list_local_blobs(bucket_path, prefix=args.prefix)
@@ -118,11 +123,21 @@ def main():
             failures.append(f"Blob '{args.key}' not found in {bucket_path}")
             print(f"[!] Blob not found: {args.key}", file=sys.stderr)
         else:
-            content = target_file.read_text(encoding="utf-8", errors="replace")
-            output_info = {"size_bytes": len(content)}
+            raw = target_file.read_bytes()
+            output_info = {"size_bytes": len(raw)}
+            try:
+                content = raw.decode("utf-8")
+                output_info["encoding"] = "utf-8"
+            except UnicodeDecodeError:
+                # Binary-safe: never corrupt blobs by force-decoding.
+                content = None
+                output_info["encoding"] = "binary"
             if args.out:
-                Path(args.out).write_text(content, encoding="utf-8")
-                print(f"[✓] Blob written to {args.out}")
+                Path(args.out).write_bytes(raw)
+                print(f"[✓] Blob written to {args.out} ({len(raw)} bytes)")
+            elif content is None:
+                print(f"[✓] Blob '{args.key}' is binary ({len(raw)} bytes); "
+                      f"wrote nothing to stdout. Use --out to download.")
             else:
                 print(content)
 
@@ -134,8 +149,10 @@ def main():
         else:
             dest_file = bucket_path / args.key
             dest_file.parent.mkdir(parents=True, exist_ok=True)
+            # Binary-safe copy (shutil preserves bytes exactly).
             shutil.copy2(src_path, dest_file)
-            output_info = {"uploaded": True, "dest": str(dest_file)}
+            output_info = {"uploaded": True, "dest": str(dest_file),
+                           "size_bytes": dest_file.stat().st_size}
             print(f"[✓] Uploaded {src_path} -> {args.key}")
 
     elif args.action == "delete":

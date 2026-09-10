@@ -6,10 +6,13 @@
 | :--- | :--- | :--- |
 | **Total Specifications** | 6 Specs | 100% |
 | **Total Functional Requirements** | 24 Requirements | 100% |
-| **Implemented in Code & Runbooks** | 24 / 24 | 100% |
+| **Implemented in Code & Runbooks** (`@implements`) | 24 / 24 | 100% |
 | **Covered in Workflows** | 24 / 24 | 100% |
-| **Verified by Automated Tests/Reports** | 24 / 24 | 100% |
+| **Verified by `@verifies` Annotations** | 24 / 24 | 100% |
 | **Overall Traceability Coverage** | **100%** | **COMPLETE** |
+
+> Verified coverage is machine-checked: `python3 tools/traceability_checker.py --strict`
+> requires every requirement to carry both `@implements` and `@verifies` tags.
 
 ---
 
@@ -49,4 +52,8 @@
 To programmatically verify that all requirement IDs above exist in code annotations:
 ```bash
 python3 tools/traceability_checker.py
+```
+Enforce both implementation and verification coverage in CI:
+```bash
+python3 tools/traceability_checker.py --strict
 ```

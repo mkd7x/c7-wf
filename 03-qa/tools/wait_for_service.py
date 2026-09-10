@@ -7,12 +7,14 @@ executing test workflows, with structured audit logging.
 """
 
 import sys
+import ssl
 import time
 import socket
 import argparse
 import urllib.request
 import urllib.error
 from pathlib import Path
+from typing import Optional
 
 # Import audit logger
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -37,14 +39,36 @@ def wait_for_tcp(host: str, port: int, timeout: int, interval: float) -> bool:
     return False
 
 
-def wait_for_http(url: str, expected_status: int, timeout: int, interval: float) -> bool:
+def build_ssl_context(insecure: bool = False, ca_cert: Optional[str] = None) -> Optional["ssl.SSLContext"]:
+    """Build a TLS context for health polling.
+
+    Default verifies certificates; --insecure trusts self-signed dev certs
+    (Aspire dashboard, local mkcert); --ca-cert pins a custom CA bundle.
+    """
+    if ca_cert:
+        ctx = ssl.create_default_context(cafile=ca_cert)
+        return ctx
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    return None
+
+
+def wait_for_http(url: str, expected_status: int, timeout: int, interval: float,
+                  insecure: bool = False, ca_cert: Optional[str] = None) -> bool:
     """Poll HTTP endpoint until expected status code is returned or timeout."""
     start_time = time.time()
     print(f"[*] Polling {url} for status {expected_status} (Timeout: {timeout}s)...")
+    context = build_ssl_context(insecure=insecure, ca_cert=ca_cert)
     while time.time() - start_time < timeout:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "QA-HealthCheck/1.0"})
-            with urllib.request.urlopen(req, timeout=interval) as resp:
+            open_kwargs: dict = {"timeout": interval}
+            if context is not None:
+                open_kwargs["context"] = context
+            with urllib.request.urlopen(req, **open_kwargs) as resp:  # type: ignore[arg-type]
                 if resp.status == expected_status:
                     elapsed = round(time.time() - start_time, 2)
                     print(f"[✓] Endpoint {url} is healthy (HTTP {resp.status}) after {elapsed}s.")
@@ -69,6 +93,9 @@ def main():
     parser.add_argument("--expect-status", "-s", type=int, default=200, help="Expected HTTP status (default: 200)")
     parser.add_argument("--timeout", type=int, default=60, help="Maximum seconds to wait (default: 60)")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between attempts (default: 1.0)")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Skip TLS certificate verification (self-signed dev certs, e.g. Aspire dashboard)")
+    parser.add_argument("--ca-cert", help="Path to a custom CA bundle for TLS verification")
     parser.add_argument("--step-id", help="Logical identifier for workflow step audit logging")
     parser.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
 
@@ -92,7 +119,11 @@ def main():
 
     elif args.url:
         target_desc = args.url
-        ok = wait_for_http(args.url, expected_status=args.expect_status, timeout=args.timeout, interval=args.interval)
+        if args.ca_cert and args.insecure:
+            print("[!] --ca-cert and --insecure are mutually exclusive.", file=sys.stderr)
+            sys.exit(1)
+        ok = wait_for_http(args.url, expected_status=args.expect_status, timeout=args.timeout,
+                           interval=args.interval, insecure=args.insecure, ca_cert=args.ca_cert)
 
     duration_ms = round((time.time() - start_time) * 1000, 2)
     step_status = "PASS" if ok else "FAIL"
@@ -103,7 +134,9 @@ def main():
         input_data={
             "target": target_desc,
             "expected_status": args.expect_status if args.url else None,
-            "timeout": args.timeout
+            "timeout": args.timeout,
+            "insecure": args.insecure if args.url else None,
+            "ca_cert": args.ca_cert if args.url else None,
         },
         output_data={
             "reachable": ok,

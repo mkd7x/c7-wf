@@ -2,7 +2,9 @@
 """
 SQL Execution & Database Seeding Tool for Clean Room QA Testing.
 Supports executing SQL queries, migrations, and seed scripts against SQLite
-and containerized databases (Microsoft SQL Server, PostgreSQL, MySQL) with audit logging.
+and containerized Microsoft SQL Server databases with audit logging.
+(PostgreSQL/MySQL container support is intentionally out of scope; the CLI
+rejects those engines with a clear error instead of NotImplementedError.)
 @implements REQ-TOOL-SQL
 """
 
@@ -71,9 +73,6 @@ def auto_discover_sql_container(engine: str = "mssql") -> Tuple[Optional[str], O
                 continue
             name, img = line.split("\t", 1)
             if engine == "mssql" and ("mssql" in img or "sql" in name):
-                container_name = name
-                break
-            elif engine == "postgres" and ("postgres" in img or "psql" in name):
                 container_name = name
                 break
 
@@ -159,30 +158,32 @@ def execute_docker_sql(
     user: str = "sa",
     password: Optional[str] = None
 ) -> Tuple[List[str], List[Tuple[Any, ...]], int]:
-    """Execute SQL query inside a running docker container."""
-    if engine == "mssql":
-        # Check tools path in container
-        sqlcmd_bin = "/opt/mssql-tools18/bin/sqlcmd"
-        cmd = ["docker", "exec", container, sqlcmd_bin, "-S", "localhost", "-U", user]
-        if password:
-            cmd.extend(["-P", password])
-        cmd.append("-C")  # Trust certificate
-        if database:
-            cmd.extend(["-d", database])
-        cmd.extend(["-Q", query])
+    """Execute SQL query inside a running docker container (mssql only)."""
+    if engine != "mssql":
+        raise ValueError(
+            f"Engine '{engine}' is not supported by the docker driver "
+            "(supported: mssql). Use --driver sqlite for local files."
+        )
+    # Check tools path in container
+    sqlcmd_bin = "/opt/mssql-tools18/bin/sqlcmd"
+    cmd = ["docker", "exec", container, sqlcmd_bin, "-S", "localhost", "-U", user]
+    if password:
+        cmd.extend(["-P", password])
+    cmd.append("-C")  # Trust certificate
+    if database:
+        cmd.extend(["-d", database])
+    cmd.extend(["-Q", query])
 
-        res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        # Fallback to mssql-tools (version 17)
+        if "No such file" in res.stderr:
+            cmd[3] = "/opt/mssql-tools/bin/sqlcmd"
+            res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
-            # Fallback to mssql-tools (version 17)
-            if "No such file" in res.stderr:
-                cmd[3] = "/opt/mssql-tools/bin/sqlcmd"
-                res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode != 0:
-                raise RuntimeError(f"Docker sqlcmd error: {res.stderr or res.stdout}")
+            raise RuntimeError(f"Docker sqlcmd error: {res.stderr or res.stdout}")
 
-        return parse_sqlcmd_table(res.stdout)
-    else:
-        raise NotImplementedError(f"Engine {engine} in docker not yet supported.")
+    return parse_sqlcmd_table(res.stdout)
 
 
 def format_table(columns: List[str], rows: List[Tuple[Any, ...]]) -> str:
@@ -226,7 +227,7 @@ def main():
     parser.add_argument("--driver", choices=["sqlite", "docker"], default="sqlite", help="Database driver type (default: sqlite)")
     parser.add_argument("--db", "-d", help="Database file path (SQLite)")
     parser.add_argument("--container", "-c", help="Docker container name or ID for containerized DB")
-    parser.add_argument("--engine", choices=["mssql", "postgres"], default="mssql", help="Database engine for docker driver")
+    parser.add_argument("--engine", choices=["mssql"], default="mssql", help="Database engine for docker driver (mssql only)")
     parser.add_argument("--database", help="Target database name (e.g. tododb)")
     parser.add_argument("--user", "-u", default="sa", help="Database username (default: sa)")
     parser.add_argument("--password", "-p", help="Database password (auto-discovered if omitted on docker)")
