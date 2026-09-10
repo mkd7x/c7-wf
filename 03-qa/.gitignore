@@ -26,8 +26,4 @@ node_modules/
 reports/*.raw.log
 tmp/
 temp/
-runs/*
-!runs/.gitkeep
-
-# Exclude target-specific workflows
-workflows/todo-api/
+runs/latest/*

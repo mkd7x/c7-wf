@@ -109,23 +109,35 @@ def scan_code_annotations(requirements: Dict[str, Dict[str, Any]], search_dirs: 
 
 
 def generate_traceability_report(requirements: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Calculate coverage statistics and summarize findings."""
+    """Calculate coverage statistics and summarize findings.
+
+    Implementation coverage (@implements) and verification coverage
+    (@verifies) are tracked separately: a requirement counts as verified
+    only with an explicit @verifies annotation (QAF-010).
+    """
     total = len(requirements)
     implemented_count = sum(1 for r in requirements.values() if r["implemented_by"])
-    verified_count = sum(1 for r in requirements.values() if r["verified_by"] or r["implemented_by"])
+    verified_count = sum(1 for r in requirements.values() if r["verified_by"])
 
     impl_rate = round((implemented_count / total * 100), 1) if total > 0 else 0.0
-    overall_status = "COMPLETE" if implemented_count == total and total > 0 else "INCOMPLETE"
+    verify_rate = round((verified_count / total * 100), 1) if total > 0 else 0.0
+    if total > 0 and implemented_count == total and verified_count == total:
+        overall_status = "COMPLETE"
+    else:
+        overall_status = "INCOMPLETE"
 
     unimplemented = [r_id for r_id, r in requirements.items() if not r["implemented_by"]]
+    unverified = [r_id for r_id, r in requirements.items() if not r["verified_by"]]
 
     return {
         "total_requirements": total,
         "implemented_count": implemented_count,
         "verified_count": verified_count,
         "coverage_percentage": impl_rate,
+        "verified_percentage": verify_rate,
         "status": overall_status,
         "unimplemented": unimplemented,
+        "unverified": unverified,
         "requirements": requirements
     }
 
@@ -148,27 +160,34 @@ def main():
     print("      SPEC-CODE REQUIREMENTS TRACEABILITY MATRIX (RTM)      ")
     print("=" * 65)
     print(f"Total Defined Requirements: {report['total_requirements']}")
-    print(f"Implemented in Code:        {report['implemented_count']} / {report['total_requirements']}")
-    print(f"Traceability Coverage:      {report['coverage_percentage']}%")
+    print(f"Implemented in Code:        {report['implemented_count']} / {report['total_requirements']} ({report['coverage_percentage']}%)")
+    print(f"Verified (@verifies):       {report['verified_count']} / {report['total_requirements']} ({report['verified_percentage']}%)")
     print(f"Overall Status:             [{report['status']}]")
     print("-" * 65)
 
-    print(f"{'Req ID':<14} {'Spec File':<24} {'Status':<10} {'Implementation'}")
+    print(f"{'Req ID':<14} {'Spec File':<24} {'Impl':<8} {'Verif':<8} {'Implementation'}")
     print("-" * 65)
 
     for req_id, data in sorted(requirements.items()):
-        status = "PASS" if data["implemented_by"] else "MISSING"
+        impl = "PASS" if data["implemented_by"] else "MISSING"
+        ver = "PASS" if data["verified_by"] else "MISSING"
         impls = ", ".join(f"{i['file']}:{i['line']}" for i in data["implemented_by"]) or "None"
-        print(f"{req_id:<14} {data['spec_file']:<24} {status:<10} {impls}")
+        print(f"{req_id:<14} {data['spec_file']:<24} {impl:<8} {ver:<8} {impls}")
 
     print("=" * 65)
 
+    failed = False
     if report["unimplemented"]:
         print(f"\n[!] Missing implementation for: {', '.join(report['unimplemented'])}")
+        failed = True
+    if report["unverified"]:
+        print(f"[!] Missing @verifies annotation for: {', '.join(report['unverified'])}")
+        failed = True
+    if failed:
         if args.strict:
             sys.exit(1)
     else:
-        print("\n[✓] 100% Spec-Code Traceability Achieved.")
+        print("\n[✓] 100% Spec-Code Traceability Achieved (implemented + verified).")
         sys.exit(0)
 
 

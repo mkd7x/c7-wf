@@ -35,16 +35,30 @@ Clean Room Testing ensures that software is evaluated in an isolated, pristine e
 
 When an agent executes clean-room testing, it must follow these rules:
 1. **Prepare Workspace**:
+   <!-- @verifies REQ-ISO-01 -->
+   <!-- @verifies REQ-ISO-02 -->
+   <!-- @verifies REQ-ISO-03 -->
    ```bash
    python3 tools/qa_runner.py setup-cleanroom --source <URL_OR_PATH>
    ```
 2. **Inspect Project Instructions**:
+   <!-- @verifies REQ-DISC-01 -->
+   <!-- @verifies REQ-DISC-02 -->
+   <!-- @verifies REQ-DISC-03 -->
+   <!-- @verifies REQ-DISC-04 -->
    ```bash
    python3 tools/qa_runner.py discover
    ```
 3. **Execute the Workflow Steps**:
+   <!-- @verifies REQ-ISO-04 -->
    Execute the required test steps according to the relevant workflow document (`smoke-test.md`, `unit-test.md`, etc.).
 4. **Compile Report**:
+   <!-- @verifies REQ-REP-01 -->
+   <!-- @verifies REQ-REP-02 -->
+   <!-- @verifies REQ-REP-03 -->
+   <!-- @verifies REQ-REP-04 -->
    Ensure results are written to `reports/` following `templates/REPORT_TEMPLATE.md`.
 5. **Verify Handoff**:
+   <!-- @verifies REQ-HAND-01 -->
+   <!-- @verifies REQ-HAND-02 -->
    Check if the overall status is `PASS` before approving handoff to `04-review`.

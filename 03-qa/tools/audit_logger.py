@@ -10,11 +10,74 @@ import os
 import sys
 import json
 import time
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
-DEFAULT_RUNS_DIR = Path(__file__).resolve().parent.parent / "runs" / "latest"
+RUNS_ROOT = Path(__file__).resolve().parent.parent / "runs"
+DEFAULT_RUNS_DIR = RUNS_ROOT / "latest"
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _new_run_id(now=None) -> str:
+    ts = (now or _utc_now()).strftime("%Y%m%d_%H%M%S")
+    return f"run-{ts}"
+
+
+def start_new_run(reason: str = "manual") -> Path:
+    """Rotate the current audit log aside and return the fresh audit path.
+
+    The previous run is preserved next to the active log as
+    ``audit.<run-id>.jsonl`` (gitignored) so sequential workflows never
+    contaminate each other's reports. Callers that need history explicitly
+    (e.g. aggregate regression reports) must read archived files or pass
+    --audit-file.
+    @implements REQ-REP-02
+    """
+    audit_file = get_audit_file_path()
+    state_file = get_state_file_path(audit_file)
+    existing = []
+    if audit_file.exists():
+        try:
+            with open(audit_file, "r", encoding="utf-8") as f:
+                existing = [line for line in f if line.strip()]
+        except Exception:
+            existing = []
+
+    if existing:
+        DEFAULT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        run_id = _new_run_id()
+        dest = DEFAULT_RUNS_DIR / f"audit.{run_id}.jsonl"
+        suffix = 0
+        while dest.exists():
+            suffix += 1
+            dest = DEFAULT_RUNS_DIR / f"audit.{run_id}-{suffix}.jsonl"
+        try:
+            shutil.move(str(audit_file), str(dest))
+            meta = {
+                "run_id": run_id,
+                "archived_at": _utc_now().isoformat(),
+                "reason": reason,
+                "steps": len(existing),
+                "path": dest.name,
+            }
+            with open(DEFAULT_RUNS_DIR / f"audit.{run_id}.meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+            print(f"[*] Archived {len(existing)} audit step(s) to runs/latest/{dest.name}")
+        except Exception as e:
+            print(f"[WARN] Failed to archive audit log: {e}")
+    if state_file.exists():
+        # State always belongs to the archived run; never leak it forward.
+        try:
+            state_file.unlink()
+        except Exception:
+            pass
+    DEFAULT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_RUNS_DIR / "audit.jsonl"
 
 
 def get_audit_file_path(custom_path: Optional[str] = None) -> Path:
@@ -133,7 +196,16 @@ def read_audit_log(custom_audit_path: Optional[str] = None) -> List[Dict[str, An
 
 
 def clear_audit(custom_audit_path: Optional[str] = None) -> None:
-    """Reset audit log and state file."""
+    """Reset audit log and state file.
+
+    The default log is rotated into runs/archive/ (instead of deleted) so
+    one workflow can never silently absorb a previous run's steps; pass an
+    explicit --audit-file for aggregate reports. Custom paths keep the
+    legacy delete behavior.
+    """
+    if custom_audit_path is None and os.environ.get("QA_AUDIT_LOG") is None:
+        start_new_run(reason="clear-audit")
+        return
     audit_file = get_audit_file_path(custom_audit_path)
     state_file = get_state_file_path(audit_file)
     if audit_file.exists():

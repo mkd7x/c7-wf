@@ -16,6 +16,8 @@ Use this step guide when an agent starts a background server or service containe
 - `--expect-status`, `-s`: Expected HTTP status (default: `200`)
 - `--timeout`: Maximum seconds to wait before failing (default: `60`)
 - `--interval`: Seconds between polling attempts (default: `1.0`)
+- `--insecure`: Skip TLS verification for self-signed dev certs
+- `--ca-cert`: Path to a custom CA bundle for TLS verification
 
 ---
 
@@ -42,8 +44,8 @@ Use this step guide when an agent starts a background server or service containe
 - **Tool**: `tools/wait_for_service.py`
 - **CLI Execution**:
 ```bash
-# 1. Start application in background
-python3 tools/qa_runner.py exec --cmd "npm start &"
+# 1. Start application in background (redirect so the launcher never blocks)
+python3 tools/qa_runner.py exec --cmd "npm start > /tmp/app.log 2>&1 &"
 
 # 2. Wait for /health readiness
 python3 tools/wait_for_service.py --url http://127.0.0.1:8080/health --expect-status 200 --timeout 45

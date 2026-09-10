@@ -18,6 +18,9 @@ Use this step guide when an agent needs to send an HTTP request (GET, POST, PUT,
 - `--expect-status`, `-s`: Expected HTTP status code(s) (e.g. `200`, `201`, `200,204`)
 - `--expect-json`: Assert that JSON response contains `key=value` or has `key`
 - `--expect-contains`: Assert that response body string contains substring
+- `--no-redirect`: Do not follow redirects; assert the 3xx directly (`Location` is audited)
+- `--insecure`: Skip TLS verification for self-signed dev certs
+- `--ca-cert`: Path to a custom CA bundle for TLS verification
 - `--verbose`, `-v`: Print verbose request and response details
 - `--save`: Save response body to a file
 

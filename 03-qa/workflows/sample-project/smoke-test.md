@@ -3,6 +3,7 @@
 <!-- @implements REQ-WORK-01 -->
 <!-- @verifies REQ-WORK-01 -->
 <!-- @verifies REQ-TOOL-HTTP -->
+<!-- @verifies REQ-HAND-03 -->
 
 ## Purpose & Scope
 Fast sanity and smoke verification for the `sample-project` test fixture. Validates cleanroom setup, instruction parsing, and execution of core smoke tests.
