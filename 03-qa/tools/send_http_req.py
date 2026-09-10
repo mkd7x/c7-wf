@@ -319,8 +319,11 @@ def main():
         else:
             print(res["body"].strip())
 
-    # Record to live audit log
-    step_status = "FAIL" if failures or not res["success"] else "PASS"
+    # Record to live audit log.
+    # A non-2xx response is only a failure when it was unexpected (assertions failed) or when the
+    # step declared no expectations at all. This keeps intentional 4xx/5xx regression checks PASS.
+    assertions_provided = bool(expected_statuses or args.expect_contains or args.expect_json)
+    step_status = "FAIL" if failures or (not assertions_provided and not res["success"]) else "PASS"
     audit_logger.record_step(
         tool="send_http_req",
         step_id=args.step_id,
