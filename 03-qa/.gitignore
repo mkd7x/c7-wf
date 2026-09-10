@@ -1,0 +1,28 @@
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Clean-room target checkout directory (DO NOT commit target repos)
+target-repo/*
+!target-repo/.gitkeep
+workspace/*
+!workspace/.gitkeep
+
+# Dependencies & caches
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+.venv/
+
+# Environment variables & secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Raw transient test logs & caches (standard Markdown reports are retained)
+*.log
+reports/*.raw.log
+tmp/
+temp/
