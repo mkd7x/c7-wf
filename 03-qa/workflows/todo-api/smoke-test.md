@@ -1,3 +1,16 @@
+---
+id: WF-TODO-000
+name: smoke-test
+target: mkd7x/todo-api
+prerequisites:
+  dotnet: ">=10.0"
+environment:
+  ASPNETCORE_ENVIRONMENT: Development
+  USE_SQLITE: "true"
+timeout_seconds: 120
+cleanup_on_failure: true
+---
+
 # Workflow: Smoke Test for `todo-api`
 
 <!-- @verifies REQ-WORK-01 -->
@@ -11,9 +24,12 @@ Fast sanity and smoke verification for the `todo-api` project. Executes automate
 
 ## Agent Runbook: Step-by-Step
 
-### Step 1: Cleanroom Setup
+### Step 1: Cleanroom Setup & Register Trap
 ```bash
 python3 tools/qa_runner.py setup-cleanroom --source https://github.com/mkd7x/todo-api.git
+
+# Register failure cleanup trap
+trap 'pkill -f TodoApi.ApiService 2>/dev/null' EXIT INT TERM
 ```
 
 ### Step 2: Execute Core Unit Tests
@@ -29,18 +45,25 @@ dotnet test target-repo/tests/TodoApi.Application.UnitTests
 # 1. Start service in background
 ASPNETCORE_ENVIRONMENT=Development USE_SQLITE=true dotnet run --project target-repo/src/TodoApi.ApiService --launch-profile http &
 
-# 2. Poll liveness
-python3 tools/wait_for_service.py --url http://localhost:5105/alive --expect-status 200 --timeout 60
+# 2. Poll liveness with audit logging
+python3 tools/wait_for_service.py \
+  --url http://localhost:5105/alive \
+  --expect-status 200 \
+  --timeout 60 \
+  --step-id step-03-liveness
 ```
 
 ### Step 4: Verify Default Todo Lists Endpoint
 ```bash
-python3 tools/send_http_req.py http://localhost:5105/api/todolists --expect-status 200 --expect-contains "Work & Projects"
+python3 tools/send_http_req.py http://localhost:5105/api/todolists \
+  --expect-status 200 \
+  --expect-contains "Work & Projects" \
+  --step-id step-04-seed-lists
 ```
 
 ### Step 5: Teardown & Report Compilation
 ```bash
-pkill -f TodoApi.ApiService
+pkill -f TodoApi.ApiService 2>/dev/null
 python3 tools/qa_runner.py report \
   --workflow smoke \
   --source todo-api \

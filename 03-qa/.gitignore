@@ -26,3 +26,5 @@ node_modules/
 reports/*.raw.log
 tmp/
 temp/
+runs/*
+!runs/.gitkeep

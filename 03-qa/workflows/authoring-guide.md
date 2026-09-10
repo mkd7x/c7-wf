@@ -3,7 +3,7 @@
 ## Overview
 Every software project has unique architecture, configuration needs, data schemas, and API contracts. In `03-qa`, workflows are organized **per repository** under `workflows/<repo-name>/<workflow_name>.md`.
 
-This guide provides instructions for AI agents and developers on how to author tailored, reproducible workflows for any project.
+Workflows are designed as **agent-executable runbooks** with machine-readable metadata, live audit logging, step output retrieval, and structured assertions.
 
 ---
 
@@ -28,15 +28,63 @@ workflows/
 
 ---
 
+## Standard Workflow Specification
+
+Every workflow must include three core structural components:
+
+### 1. YAML Frontmatter Metadata
+Workflows must declare prerequisites and timeouts at the top of the file:
+```yaml
+---
+id: WF-TODO-001
+name: aspire-orchestration-e2e
+target: mkd7x/todo-api
+prerequisites:
+  docker: true
+  dotnet: ">=10.0"
+environment:
+  ASPNETCORE_ENVIRONMENT: Development
+timeout_seconds: 300
+cleanup_on_failure: true
+---
+```
+
+### 2. Mandatory Teardown Traps
+To ensure background processes or containers do not linger if a step fails:
+```bash
+# Register shell cleanup trap
+trap 'pkill -f TodoApi.AppHost 2>/dev/null; docker stop $(docker ps -q --filter "ancestor=mcr.microsoft.com/mssql/server:2022-latest") 2>/dev/null' EXIT INT TERM
+```
+
+### 3. Step IDs & Live Audit Logging
+Every tool command must provide a unique `--step-id <name>`. This automatically logs the complete HTTP request/response or SQL output into `03-qa/runs/latest/audit.jsonl` and `execution_state.json`.
+
+```bash
+# Example Step 5:
+python3 tools/send_http_req.py http://localhost:5105/api/todolists \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Sprint Backlog", "colour": "#FF5722"}' \
+  --step-id step-05-create-list \
+  --expect-status 201 \
+  --expect-json "id"
+```
+
+Subsequent steps can inspect previous step output without brittle shell variables:
+```bash
+# Retrieve output or specific field from a prior step:
+python3 tools/qa_runner.py get-step-output --step step-05-create-list --query output.body.id
+```
+
+---
+
 ## Workflow Authoring Lifecycle for AI Agents
 
-When an agent is tasked with testing a repository `<repo-name>` that lacks a pre-existing workflow:
-
 ```
-1. Discover Project Structure ──> 2. Select Step Templates from examples/
-                                              │
-                                              ▼
-4. Execute Workflow & Report  <── 3. Generate workflows/<repo-name>/<wf>.md
+1. Discover Target Context ──> 2. Scaffold Workflow with Frontmatter & Steps
+                                            │
+                                            ▼
+4. Execute with Audit Log  <── 3. Lint with qa_runner.py lint-workflow
 ```
 
 ### 1. Discover Project Context
@@ -44,32 +92,22 @@ Inspect the repository:
 ```bash
 python3 tools/qa_runner.py discover --target target-repo
 ```
-Examine:
-- `target-repo/TESTING.md` and `target-repo/README.md`
-- Port numbers, configuration files (`.env.example`), and database connections
-- Package scripts or Makefiles
 
-### 2. Choose and Tailor Steps
-Assemble workflow steps using the reference guides in `workflows/examples/`:
-- **For API endpoints**: Consult [examples/http-request-step.md](examples/http-request-step.md)
-- **For SQLite/relational state**: Consult [examples/sql-seed-step.md](examples/sql-seed-step.md)
-- **For file/blob uploads**: Consult [examples/blob-storage-step.md](examples/blob-storage-step.md)
-- **For server startup**: Consult [examples/health-polling-step.md](examples/health-polling-step.md)
+### 2. Author Workflow Runbook
+Create `workflows/<repo-name>/<workflow_name>.md` following [examples/workflow-template.md](examples/workflow-template.md).
 
-### 3. Step Specification Standard
-Every step in the generated workflow should contain:
-1. **Step Name & Objective**
-2. **Action Type** (Setup, SQL, HTTP, Blob, Healthcheck, Teardown)
-3. **Tool Used** (e.g. `tools/send_http_req.py`)
-4. **Structured Specification** (JSON, SQL, or parameters)
-5. **Exact CLI Command** (Ready to copy or execute)
-
-### 4. Create the Project Workflow
-Write the generated workflow to:
-`workflows/<repo-name>/<workflow_name>.md`
-
-### 5. Execute and Record
-Execute the steps in order and generate the report:
+### 3. Lint the Workflow
+Verify tool references, valid CLI options, and YAML frontmatter:
 ```bash
-python3 tools/qa_runner.py report --workflow <name> --source <repo-name> --status PASS --notes "Custom workflow executed."
+python3 tools/qa_runner.py lint-workflow --file workflows/<repo-name>/<workflow_name>.md
+```
+
+### 4. Execute and Generate Report
+When all steps complete, compile the final report directly from the live audit log:
+```bash
+python3 tools/qa_runner.py report \
+  --workflow <name> \
+  --source <repo-name> \
+  --status PASS \
+  --notes "Full workflow verified via live audit log."
 ```

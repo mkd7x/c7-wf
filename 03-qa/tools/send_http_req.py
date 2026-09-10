@@ -2,17 +2,25 @@
 """
 HTTP Request Helper Tool for Clean Room QA Testing.
 Sends HTTP requests, measures latency, and performs automated assertions
-on status code, headers, and response payloads.
+on status code, headers, and nested JSON response payloads with audit logging.
 @implements REQ-TOOL-HTTP
 """
 
 import sys
+import os
+import re
 import json
 import time
 import argparse
 import urllib.request
 import urllib.error
-from typing import Dict, List, Optional, Any
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+
+# Import audit logger
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import audit_logger
 
 
 def send_request(
@@ -26,13 +34,12 @@ def send_request(
     method = method.upper()
     req_headers = headers or {}
 
-    # Default User-Agent if not provided
     if "User-Agent" not in req_headers:
         req_headers["User-Agent"] = "QA-CleanRoom-Agent/1.0"
 
     encoded_data = None
     if data is not None:
-        if isinstance(data, dict) or isinstance(data, list):
+        if isinstance(data, (dict, list)):
             encoded_data = json.dumps(data).encode("utf-8")
             if "Content-Type" not in req_headers:
                 req_headers["Content-Type"] = "application/json"
@@ -55,7 +62,6 @@ def send_request(
             body_bytes = response.read()
             body_text = body_bytes.decode("utf-8", errors="replace")
 
-            # Try parsing JSON body
             try:
                 json_data = json.loads(body_text)
             except Exception:
@@ -99,11 +105,89 @@ def send_request(
         }
 
 
+def resolve_json_path(data: Any, path: str) -> Tuple[bool, Any]:
+    """
+    Traverse nested JSON using dot and array index notation.
+    Supports: 'items[0].title', 'items.length', 'data.user.id'.
+    """
+    tokens = []
+    raw_parts = [p for p in path.split(".") if p]
+    for part in raw_parts:
+        matches = re.findall(r"([^\[]+)?\[(\d+)\]", part)
+        if matches:
+            for key, idx in matches:
+                if key:
+                    tokens.append(key)
+                tokens.append(int(idx))
+        else:
+            tokens.append(part)
+
+    curr = data
+    for token in tokens:
+        if curr is None:
+            return False, None
+        if isinstance(token, str) and token == "length":
+            if isinstance(curr, (list, dict, str)):
+                curr = len(curr)
+                continue
+            return False, None
+        if isinstance(token, int):
+            if isinstance(curr, list) and 0 <= token < len(curr):
+                curr = curr[token]
+            else:
+                return False, None
+        elif isinstance(curr, dict):
+            if token in curr:
+                curr = curr[token]
+            else:
+                return False, None
+        else:
+            return False, None
+    return True, curr
+
+
+def compare_values(actual: Any, op: str, expected_str: str) -> Tuple[bool, str]:
+    """Compare actual value against expected_str using op (=, !=, >=, <=, >, <)."""
+    expected_str = expected_str.strip()
+    if isinstance(actual, bool):
+        if expected_str.lower() in ("true", "false"):
+            exp_bool = expected_str.lower() == "true"
+            if op == "=":
+                return actual == exp_bool, f"expected {exp_bool}"
+            if op == "!=":
+                return actual != exp_bool, f"expected not {exp_bool}"
+
+    if isinstance(actual, (int, float)):
+        try:
+            exp_num = float(expected_str) if "." in expected_str else int(expected_str)
+            if op == "=":
+                return actual == exp_num, f"expected {exp_num}"
+            if op == "!=":
+                return actual != exp_num, f"expected not {exp_num}"
+            if op == ">=":
+                return actual >= exp_num, f"expected >= {exp_num}"
+            if op == "<=":
+                return actual <= exp_num, f"expected <= {exp_num}"
+            if op == ">":
+                return actual > exp_num, f"expected > {exp_num}"
+            if op == "<":
+                return actual < exp_num, f"expected < {exp_num}"
+        except ValueError:
+            pass
+
+    actual_str = str(actual)
+    if op == "=":
+        return actual_str == expected_str, f"expected '{expected_str}'"
+    if op == "!=":
+        return actual_str != expected_str, f"expected not '{expected_str}'"
+    return False, f"unsupported operator '{op}'"
+
+
 def check_assertions(
     res: Dict[str, Any],
     expect_status: Optional[List[int]] = None,
     expect_contains: Optional[List[str]] = None,
-    expect_json_keys: Optional[List[str]] = None
+    expect_json_exprs: Optional[List[str]] = None
 ) -> List[str]:
     """Evaluate assertions against HTTP response and return list of failure messages."""
     failures = []
@@ -116,32 +200,39 @@ def check_assertions(
 
     if expect_contains:
         for needle in expect_contains:
-            if needle not in res["body"]:
+            if needle.lower() not in res["body"].lower():
                 failures.append(
                     f"Expected body to contain '{needle}', but string was not found."
                 )
 
-    if expect_json_keys:
+    if expect_json_exprs:
         if not res["json"]:
-            failures.append("Expected valid JSON response for JSON key assertion, but body was not JSON.")
+            failures.append("Expected valid JSON response for JSON assertion, but body was not JSON.")
         else:
-            for expr in expect_json_keys:
-                if "=" in expr:
-                    key, expected_val = expr.split("=", 1)
-                    actual_raw = res["json"].get(key.strip())
-                    actual_val = str(actual_raw)
-                    expected_str = expected_val.strip()
-                    if isinstance(actual_raw, bool):
-                        matches = actual_val.lower() == expected_str.lower()
+            for expr in expect_json_exprs:
+                expr = expr.strip()
+                # Parse operator
+                matched_op = None
+                for op in (">=", "<=", "!=", "=", ">", "<"):
+                    if op in expr:
+                        matched_op = op
+                        break
+
+                if matched_op:
+                    path, expected_val = expr.split(matched_op, 1)
+                    path = path.strip()
+                    found, actual_val = resolve_json_path(res["json"], path)
+                    if not found:
+                        failures.append(f"JSON path '{path}' not found in response.")
                     else:
-                        matches = actual_val == expected_str
-                    if not matches:
-                        failures.append(
-                            f"JSON key '{key}' had value '{actual_val}', expected '{expected_val}'."
-                        )
+                        matches, reason = compare_values(actual_val, matched_op, expected_val)
+                        if not matches:
+                            failures.append(f"JSON path '{path}' had value '{actual_val}', {reason}.")
                 else:
-                    if expr.strip() not in res["json"]:
-                        failures.append(f"JSON key '{expr}' not found in response.")
+                    # Existence check
+                    found, _ = resolve_json_path(res["json"], expr)
+                    if not found:
+                        failures.append(f"JSON path '{expr}' not found in response.")
 
     return failures
 
@@ -156,8 +247,10 @@ def main():
     parser.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
     parser.add_argument("--expect-status", "-s", help="Comma-separated expected status codes (e.g. '200,201')")
     parser.add_argument("--expect-contains", action="append", help="Assert that response body contains string")
-    parser.add_argument("--expect-json", action="append", help="Assert JSON property (e.g. 'status=ok' or 'id')")
+    parser.add_argument("--expect-json", action="append", help="Assert JSON path (e.g. 'id=3', 'items[0].title=foo', 'items.length>=1')")
     parser.add_argument("--save", help="Save response body to specified file path")
+    parser.add_argument("--step-id", help="Logical identifier for workflow step audit logging (e.g. 'step-05-create-list')")
+    parser.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print request and response headers")
 
     args = parser.parse_args()
@@ -208,7 +301,7 @@ def main():
         res=res,
         expect_status=expected_statuses,
         expect_contains=args.expect_contains,
-        expect_json_keys=args.expect_json
+        expect_json_exprs=args.expect_json
     )
 
     if args.save and res["body"]:
@@ -225,6 +318,35 @@ def main():
             print(json.dumps(res["json"], indent=2))
         else:
             print(res["body"].strip())
+
+    # Record to live audit log
+    step_status = "FAIL" if failures or not res["success"] else "PASS"
+    audit_logger.record_step(
+        tool="send_http_req",
+        step_id=args.step_id,
+        input_data={
+            "url": args.url,
+            "method": args.method,
+            "headers": headers,
+            "data": data
+        },
+        output_data={
+            "status_code": res["status_code"],
+            "duration_ms": res["duration_ms"],
+            "headers": res["headers"],
+            "body": res["json"] if res["json"] is not None else res["body"]
+        },
+        assertions={
+            "expected_status": expected_statuses,
+            "expected_contains": args.expect_contains,
+            "expected_json": args.expect_json,
+            "passed": len(failures) == 0,
+            "failures": failures
+        },
+        duration_ms=res["duration_ms"],
+        status=step_status,
+        custom_audit_path=args.audit_file
+    )
 
     if failures:
         print("\n[!] HTTP Assertions FAILED:", file=sys.stderr)

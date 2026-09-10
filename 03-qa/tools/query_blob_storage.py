@@ -2,7 +2,7 @@
 """
 Blob & Object Storage Query Helper for Clean Room QA Testing.
 Inspects, queries, and asserts object states in local mock blob directories
-and S3/MinIO compatible object stores.
+and S3/MinIO compatible object stores with audit logging.
 @implements REQ-TOOL-BLOB
 """
 
@@ -10,10 +10,16 @@ import os
 import sys
 import json
 import shutil
+import time
 import argparse
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+
+# Import audit logger
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import audit_logger
 
 
 def list_local_blobs(bucket_dir: Path, prefix: str = "") -> List[Dict[str, Any]]:
@@ -39,6 +45,9 @@ def list_local_blobs(bucket_dir: Path, prefix: str = "") -> List[Dict[str, Any]]
 
 def main():
     parser = argparse.ArgumentParser(description="Clean Room Blob & Object Storage Query CLI")
+    parser.add_argument("--step-id", help="Logical identifier for workflow step audit logging")
+    parser.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
+
     subparsers = parser.add_subparsers(dest="action", help="Storage action")
 
     # list
@@ -75,10 +84,14 @@ def main():
         parser.print_help()
         sys.exit(0)
 
+    start_time = time.time()
     bucket_path = Path(args.dir).resolve()
+    failures = []
+    output_info = {}
 
     if args.action == "list":
         blobs = list_local_blobs(bucket_path, prefix=args.prefix)
+        output_info = {"blobs": blobs, "count": len(blobs)}
         if args.json:
             print(json.dumps(blobs, indent=2))
         else:
@@ -92,42 +105,72 @@ def main():
     elif args.action == "exists":
         target_file = bucket_path / args.key
         if target_file.is_file():
+            output_info = {"exists": True, "size_bytes": target_file.stat().st_size}
             print(f"[✓] Blob exists: {args.key} ({target_file.stat().st_size} bytes)")
-            sys.exit(0)
         else:
+            failures.append(f"Blob '{args.key}' not found in {bucket_path}")
+            output_info = {"exists": False}
             print(f"[!] Blob NOT found: {args.key}", file=sys.stderr)
-            sys.exit(1)
 
     elif args.action == "get":
         target_file = bucket_path / args.key
         if not target_file.is_file():
+            failures.append(f"Blob '{args.key}' not found in {bucket_path}")
             print(f"[!] Blob not found: {args.key}", file=sys.stderr)
-            sys.exit(1)
-        content = target_file.read_text(encoding="utf-8", errors="replace")
-        if args.out:
-            Path(args.out).write_text(content, encoding="utf-8")
-            print(f"[✓] Blob written to {args.out}")
         else:
-            print(content)
+            content = target_file.read_text(encoding="utf-8", errors="replace")
+            output_info = {"size_bytes": len(content)}
+            if args.out:
+                Path(args.out).write_text(content, encoding="utf-8")
+                print(f"[✓] Blob written to {args.out}")
+            else:
+                print(content)
 
     elif args.action == "put":
         src_path = Path(args.file)
         if not src_path.is_file():
+            failures.append(f"Source file not found: {src_path}")
             print(f"[!] Source file not found: {src_path}", file=sys.stderr)
-            sys.exit(1)
-        dest_file = bucket_path / args.key
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, dest_file)
-        print(f"[✓] Uploaded {src_path} -> {args.key}")
+        else:
+            dest_file = bucket_path / args.key
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dest_file)
+            output_info = {"uploaded": True, "dest": str(dest_file)}
+            print(f"[✓] Uploaded {src_path} -> {args.key}")
 
     elif args.action == "delete":
         target_file = bucket_path / args.key
         if target_file.is_file():
             target_file.unlink()
+            output_info = {"deleted": True}
             print(f"[✓] Deleted blob {args.key}")
         else:
+            failures.append(f"Blob '{args.key}' not found to delete")
             print(f"[!] Blob not found to delete: {args.key}", file=sys.stderr)
-            sys.exit(1)
+
+    duration_ms = round((time.time() - start_time) * 1000, 2)
+    step_status = "FAIL" if failures else "PASS"
+
+    audit_logger.record_step(
+        tool="query_blob_storage",
+        step_id=args.step_id,
+        input_data={
+            "action": args.action,
+            "dir": str(bucket_path),
+            "key": getattr(args, "key", None),
+            "prefix": getattr(args, "prefix", None)
+        },
+        output_data=output_info,
+        assertions={
+            "passed": len(failures) == 0,
+            "failures": failures
+        },
+        duration_ms=duration_ms,
+        status=step_status,
+        custom_audit_path=args.audit_file
+    )
+
+    sys.exit(0 if not failures else 1)
 
 
 if __name__ == "__main__":

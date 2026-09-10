@@ -2,7 +2,7 @@
 """
 Service Readiness & Health Polling Tool for Clean Room QA Testing.
 Polls an HTTP endpoint or TCP port until the service becomes ready before
-executing test workflows.
+executing test workflows, with structured audit logging.
 @implements REQ-TOOL-WAIT
 """
 
@@ -12,6 +12,12 @@ import socket
 import argparse
 import urllib.request
 import urllib.error
+from pathlib import Path
+
+# Import audit logger
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import audit_logger
 
 
 def wait_for_tcp(host: str, port: int, timeout: int, interval: float) -> bool:
@@ -63,6 +69,8 @@ def main():
     parser.add_argument("--expect-status", "-s", type=int, default=200, help="Expected HTTP status (default: 200)")
     parser.add_argument("--timeout", type=int, default=60, help="Maximum seconds to wait (default: 60)")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between attempts (default: 1.0)")
+    parser.add_argument("--step-id", help="Logical identifier for workflow step audit logging")
+    parser.add_argument("--audit-file", help="Custom path to audit.jsonl log file")
 
     args = parser.parse_args()
 
@@ -70,17 +78,48 @@ def main():
         print("[!] Specify either --url or --tcp to wait for.", file=sys.stderr)
         sys.exit(1)
 
+    start_time = time.time()
+    ok = False
+    target_desc = ""
+
     if args.tcp:
         if ":" not in args.tcp:
             print("[!] TCP format must be host:port (e.g. 127.0.0.1:8080)", file=sys.stderr)
             sys.exit(1)
         host, port_s = args.tcp.split(":", 1)
+        target_desc = f"tcp://{host}:{port_s}"
         ok = wait_for_tcp(host, int(port_s), timeout=args.timeout, interval=args.interval)
-        sys.exit(0 if ok else 1)
 
-    if args.url:
+    elif args.url:
+        target_desc = args.url
         ok = wait_for_http(args.url, expected_status=args.expect_status, timeout=args.timeout, interval=args.interval)
-        sys.exit(0 if ok else 1)
+
+    duration_ms = round((time.time() - start_time) * 1000, 2)
+    step_status = "PASS" if ok else "FAIL"
+
+    audit_logger.record_step(
+        tool="wait_for_service",
+        step_id=args.step_id,
+        input_data={
+            "target": target_desc,
+            "expected_status": args.expect_status if args.url else None,
+            "timeout": args.timeout
+        },
+        output_data={
+            "reachable": ok,
+            "duration_ms": duration_ms
+        },
+        assertions={
+            "expected_reachable": True,
+            "passed": ok,
+            "failures": [] if ok else [f"Failed to reach {target_desc} within {args.timeout}s"]
+        },
+        duration_ms=duration_ms,
+        status=step_status,
+        custom_audit_path=args.audit_file
+    )
+
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,15 @@
+---
+id: WF-TEMPLATE-001
+name: workflow-template
+target: sample-project
+prerequisites:
+  python: ">=3.10"
+environment:
+  ENV: test
+timeout_seconds: 180
+cleanup_on_failure: true
+---
+
 # Workflow: [Workflow Name] for `[Repo Name]`
 
 <!-- @verifies REQ-WORK-01 -->
@@ -14,25 +26,35 @@ Describe the objective of this workflow for `[Repo Name]`.
 python3 tools/qa_runner.py setup-cleanroom --source [TARGET_SOURCE]
 ```
 
-### Step 2: Configure Environment & Credentials
-Set environment variables or create `target-repo/.env.test`:
+### Step 2: Configure Environment & Register Teardown Trap
+Set test environment variables and register a cleanup trap:
 ```bash
 export PORT=8080
 export DB_PATH="target-repo/test.db"
+
+# Register teardown trap
+trap 'pkill -f [PROCESS_NAME] 2>/dev/null' EXIT INT TERM
 ```
 
 ### Step 3: Database Seeding (if applicable)
 ```bash
-python3 tools/run_sql_cmd.py --db target-repo/test.db --file fixtures/seed.sql
+python3 tools/run_sql_cmd.py \
+  --db target-repo/test.db \
+  --file fixtures/seed.sql \
+  --step-id step-03-seed-db
 ```
 
 ### Step 4: Start Application & Poll Health
 ```bash
-# 1. Start application
+# 1. Start application in background
 python3 tools/qa_runner.py exec --cmd "[START_COMMAND] &"
 
-# 2. Wait for healthcheck
-python3 tools/wait_for_service.py --url http://127.0.0.1:8080/health --expect-status 200 --timeout 60
+# 2. Wait for healthcheck with audit logging
+python3 tools/wait_for_service.py \
+  --url http://127.0.0.1:8080/health \
+  --expect-status 200 \
+  --timeout 60 \
+  --step-id step-04-health-poll
 ```
 
 ### Step 5: Test Execution & Assertions
@@ -42,11 +64,22 @@ python3 tools/send_http_req.py http://127.0.0.1:8080/api/v1/[ENDPOINT] \
   -H "Content-Type: application/json" \
   -d '[PAYLOAD_JSON]' \
   --expect-status 200 \
-  --expect-json "[KEY]=[VALUE]"
+  --expect-json "[KEY]=[VALUE]" \
+  --step-id step-05-api-test
 ```
 
-### Step 6: Teardown & Report Compilation
+### Step 6: Query Step State (if dependent steps exist)
 ```bash
-# Kill background server and clean up sockets
-python3 tools/qa_runner.py report --workflow [WORKFLOW_NAME] --source [REPO_NAME] --status PASS --notes "Completed [Workflow Name]."
+# Inspect generated value from step 5:
+python3 tools/qa_runner.py get-step-output --step step-05-api-test --query output.body.id
+```
+
+### Step 7: Teardown & Report Compilation
+```bash
+# Compile report directly from live audit log
+python3 tools/qa_runner.py report \
+  --workflow [WORKFLOW_NAME] \
+  --source [REPO_NAME] \
+  --status PASS \
+  --notes "Completed [Workflow Name]."
 ```
