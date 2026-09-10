@@ -29,17 +29,19 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import test_discovery
 
 
-def clean_directory_contents(target_path: Path):
+def clean_directory_contents(target_path: Path, preserve_gitkeep: bool = True):
     """
-    Remove all files and subdirectories inside target_path except .gitkeep.
+    Remove all files and subdirectories inside target_path.
     @implements REQ-ISO-01
     """
     if not target_path.exists():
         target_path.mkdir(parents=True, exist_ok=True)
+        if preserve_gitkeep:
+            (target_path / ".gitkeep").touch()
         return
 
     for item in target_path.iterdir():
-        if item.name == ".gitkeep":
+        if preserve_gitkeep and item.name == ".gitkeep":
             continue
         try:
             if item.is_dir() and not item.is_symlink():
@@ -49,6 +51,9 @@ def clean_directory_contents(target_path: Path):
         except Exception as e:
             print(f"[WARN] Failed to remove {item}: {e}")
 
+    if preserve_gitkeep and not (target_path / ".gitkeep").exists():
+        (target_path / ".gitkeep").touch()
+
 
 def setup_cleanroom(source: str, target: Path = DEFAULT_TARGET, branch: Optional[str] = None) -> bool:
     """
@@ -56,11 +61,11 @@ def setup_cleanroom(source: str, target: Path = DEFAULT_TARGET, branch: Optional
     @implements REQ-ISO-02
     """
     print(f"[*] Setting up clean-room in: {target}")
-    clean_directory_contents(target)
 
     source_path = Path(source).expanduser().resolve() if Path(source).expanduser().exists() else None
 
     if source_path and source_path.is_dir():
+        clean_directory_contents(target, preserve_gitkeep=True)
         print(f"[*] Copying from local source: {source_path}")
         # Copy directory tree excluding .git to ensure clean state
         for item in source_path.iterdir():
@@ -73,7 +78,8 @@ def setup_cleanroom(source: str, target: Path = DEFAULT_TARGET, branch: Optional
                 shutil.copy2(item, dest)
         return True
     else:
-        # Treat as Git URL
+        # Treat as Git URL: destination must be completely empty or non-existent
+        clean_directory_contents(target, preserve_gitkeep=False)
         print(f"[*] Cloning remote git repository: {source}")
         cmd = ["git", "clone", "--depth", "1"]
         if branch:
