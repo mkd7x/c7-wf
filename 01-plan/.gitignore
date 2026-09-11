@@ -1,14 +1,11 @@
-# Operating System files
-.DS_Store
-Thumbs.db
+# Ephemeral session runs and task graph outputs
+runs/*
+!runs/.gitkeep
 
-# Environment variables & secrets
+# Python cache artifacts
+__pycache__/
+*.pyc
+
+# Local environment secrets (Jira tokens, etc.)
 .env
-.env.local
-*.pem
-*.key
-
-# Temporary files & logs
-*.log
-tmp/
-temp/
+.env.*
