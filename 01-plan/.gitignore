@@ -9,3 +9,15 @@ __pycache__/
 # Local environment secrets (Jira tokens, etc.)
 .env
 .env.*
+.env.local
+*.pem
+*.key
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Temporary files & logs
+*.log
+tmp/
+temp/

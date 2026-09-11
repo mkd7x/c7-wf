@@ -55,6 +55,21 @@ class TestContextDiscovery(unittest.TestCase):
         self.assertTrue(any("api.py" in r["file"] for r in route_info["detected_route_files"]))
         self.assertIn("migration.sql", route_info["detected_schema_files"])
 
+    # @verifies REQ-DISC-02
+    def test_excluded_dirs_not_scanned(self):
+        (self.root / "node_modules" / "domain").mkdir(parents=True)
+        (self.root / "real").mkdir()
+        boundary_info = context_discovery.detect_boundaries_and_adrs(self.root)
+        self.assertNotIn("node_modules/domain", boundary_info["architecture_layers"])
+
+    # @verifies REQ-DISC-03
+    def test_oversized_files_skipped_in_route_scan(self):
+        big = self.root / "big.py"
+        big.write_text("@app.get('/x')\n" + "x" * (context_discovery.MAX_SCAN_FILE_BYTES + 1),
+                       encoding="utf-8")
+        route_info = context_discovery.detect_routes_and_schemas(self.root)
+        self.assertFalse(any("big.py" in r["file"] for r in route_info["detected_route_files"]))
+
     # @verifies REQ-DISC-04
     def test_context_snapshotting(self):
         (self.root / "pyproject.toml").write_text("dependencies = ['flask']", encoding="utf-8")

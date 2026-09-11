@@ -7,6 +7,7 @@ Unit tests for jira_client.py
 
 import unittest
 import sys
+import json
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
@@ -47,6 +48,84 @@ class TestJiraClient(unittest.TestCase):
         subtasks = self.client.create_subtasks("PROJ-999", tasks)
         self.assertEqual(len(subtasks), 2)
         self.assertEqual(subtasks[0]["parent_key"], "PROJ-999")
+        self.assertEqual(subtasks[0]["status"], "CREATED_MOCK")
+        self.assertTrue(subtasks[0]["is_mock"])
+
+    # @verifies REQ-WORK-03
+    def test_create_subtasks_failure_recorded_not_fabricated(self):
+        import urllib.request
+        client = jira_client.JiraClient(
+            base_url="http://127.0.0.1:1", email="t@e.com", api_token="tok")
+        self.assertFalse(client.dry_run)
+        orig_urlopen = urllib.request.urlopen
+
+        def boom(*a, **k):
+            raise ConnectionError("refused")
+
+        urllib.request.urlopen = boom
+        try:
+            res = client.create_subtasks(
+                "PROJ-999", [{"id": "TASK-01", "title": "Setup Schema"}])
+        finally:
+            urllib.request.urlopen = orig_urlopen
+        self.assertEqual(res[0]["status"], "FAILED")
+        self.assertIsNone(res[0]["subtask_key"])
+        self.assertFalse(res[0]["is_mock"])
+
+    # @verifies REQ-WORK-03
+    def test_render_plan_comment_uses_template(self):
+        tasks = [
+            {"id": "TASK-01", "title": "Setup Schema", "wave": 1,
+             "dependencies": [], "component": "Infra",
+             "qa_criteria": {"action": "check", "expected_outcome": "pass"}},
+            {"id": "TASK-02", "title": "Build Service", "wave": 2,
+             "dependencies": ["TASK-01"], "component": "App",
+             "qa_criteria": {"action": "test", "expected_outcome": "pass"}},
+        ]
+        comment = jira_client.render_plan_comment(
+            plan_id="PLAN-001", plan_title="Demo", plan_file="demo_plan.md",
+            target_branch="feature/demo", commit_sha="abc123", tasks=tasks)
+        self.assertIn("PLAN-001", comment)
+        self.assertIn("TASK-01", comment)
+        self.assertIn("TASK-02", comment)
+        self.assertIn("2 scenarios", comment)
+        self.assertNotIn("{{", comment)
+
+    # @verifies REQ-WORK-03
+    def test_post_json_extracts_jira_error_body(self):
+        import urllib.request
+        import urllib.error
+        import io
+        client = jira_client.JiraClient(
+            base_url="http://127.0.0.1:1", email="t@e.com", api_token="tok")
+        self.assertFalse(client.dry_run)
+        orig_urlopen = urllib.request.urlopen
+
+        error_json = json.dumps({
+            "errorMessages": ["Issue type is invalid"],
+            "errors": {"summary": "Field is required"}
+        }).encode("utf-8")
+
+        import email.message
+        def fake_urlopen(*a, **k):
+            fp = io.BytesIO(error_json)
+            raise urllib.error.HTTPError(
+                url="http://127.0.0.1:1/rest/api/2/issue",
+                code=400,
+                msg="Bad Request",
+                hdrs=email.message.Message(),
+                fp=fp
+            )
+
+        urllib.request.urlopen = fake_urlopen
+        try:
+            ok, err = client._post_json("http://127.0.0.1:1/rest/api/2/issue", {})
+        finally:
+            urllib.request.urlopen = orig_urlopen
+
+        self.assertFalse(ok)
+        self.assertIn("Issue type is invalid", err)
+        self.assertIn("summary: Field is required", err)
 
 
 if __name__ == "__main__":

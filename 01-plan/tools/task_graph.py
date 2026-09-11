@@ -106,6 +106,7 @@ def parse_tasks_from_markdown(content: str) -> List[Dict[str, Any]]:
 def validate_dag(tasks: List[Dict[str, Any]]) -> Tuple[bool, List[str], List[str]]:
     """
     Validate DAG constraints:
+    - No duplicate task IDs
     - All declared dependencies exist
     - No self-dependencies
     - No circular dependency cycles
@@ -118,6 +119,17 @@ def validate_dag(tasks: List[Dict[str, Any]]) -> Tuple[bool, List[str], List[str
     if not tasks:
         warnings.append("No tasks found in document.")
         return True, errors, warnings
+
+    # Check for duplicate task IDs
+    seen: Set[str] = set()
+    duplicates: Set[str] = set()
+    for t in tasks:
+        tid = t["id"]
+        if tid in seen:
+            duplicates.add(tid)
+        seen.add(tid)
+    for dup in sorted(duplicates):
+        errors.append(f"Duplicate task ID detected: '{dup}' (task IDs must be unique).")
 
     # Check for non-existent dependencies and self-loops
     adj: Dict[str, List[str]] = {t["id"]: [] for t in tasks}
@@ -159,6 +171,22 @@ def validate_dag(tasks: List[Dict[str, Any]]) -> Tuple[bool, List[str], List[str
         cycle_str = " -> ".join(c)
         errors.append(f"Circular dependency detected: {cycle_str}")
 
+    # Warn when a declared Wave contradicts the topological position.
+    # Declared waves are informational; computed waves govern execution.
+    if not errors:
+        try:
+            _waves = compute_execution_waves(tasks)
+            position = {t["id"]: idx + 1 for idx, wave in enumerate(_waves) for t in wave}
+            for t in tasks:
+                declared = t.get("wave")
+                if declared is not None and declared != position.get(t["id"]):
+                    warnings.append(
+                        f"Task '{t['id']}' declares Wave {declared} but topological "
+                        f"order places it in Wave {position.get(t['id'])}."
+                    )
+        except ValueError:
+            pass
+
     is_valid = len(errors) == 0
     return is_valid, errors, warnings
 
@@ -166,35 +194,52 @@ def validate_dag(tasks: List[Dict[str, Any]]) -> Tuple[bool, List[str], List[str
 def compute_execution_waves(tasks: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     """
     Compute topological execution waves (layers where all dependencies are satisfied by previous waves).
-    Wave 0 / Wave 1 contains independent tasks.
+    Wave 1 contains independent tasks.
+    NOTE: The declared `Wave` field on each task is informational only and is
+    ignored here; computed waves govern execution. Use validate_dag() to flag
+    mismatches between declared and topological positions.
+    Raises ValueError if task IDs are duplicated or if any task is unresolvable
+    (missing dependency or dependency cycle) instead of silently returning
+    partial/empty waves.
     @implements REQ-TASK-04
     """
     if not tasks:
         return []
 
+    ids = [t["id"] for t in tasks]
+    if len(set(ids)) != len(ids):
+        seen: Set[str] = set()
+        dups = sorted({tid for tid in ids if tid in seen or seen.add(tid)})
+        raise ValueError(f"Cannot compute execution waves: duplicate task IDs {dups}.")
+
     task_map = {t["id"]: t for t in tasks}
-    in_degree = {t["id"]: len(t["dependencies"]) for t in tasks}
-    # reverse adjacency: dep -> tasks that depend on dep
-    dependents: Dict[str, List[str]] = {t["id"]: [] for t in tasks}
-    for t in tasks:
-        for dep in t["dependencies"]:
-            if dep in dependents:
-                dependents[dep].append(t["id"])
 
     waves = []
     completed: Set[str] = set()
     remaining = set(task_map.keys())
 
     while remaining:
-        # Find all tasks whose dependencies are fully completed
-        current_wave_ids = [
+        # Find all tasks whose dependencies are fully completed (sorted for determinism)
+        current_wave_ids = sorted(
             tid for tid in remaining
             if all(dep in completed for dep in task_map[tid]["dependencies"])
-        ]
+        )
 
         if not current_wave_ids:
-            # Cycle or broken dependency prevented forward progress
-            break
+            # Cycle or broken dependency prevented forward progress: fail loudly
+            unresolved = sorted(remaining)
+            missing = sorted({dep for tid in unresolved
+                              for dep in task_map[tid]["dependencies"]
+                              if dep not in task_map})
+            if missing:
+                raise ValueError(
+                    f"Cannot compute execution waves: tasks {unresolved} reference "
+                    f"non-existent dependencies {missing}."
+                )
+            raise ValueError(
+                f"Cannot compute execution waves: circular or unresolvable "
+                f"dependencies among tasks {unresolved}."
+            )
 
         current_wave = [task_map[tid] for tid in current_wave_ids]
         waves.append(current_wave)
@@ -233,7 +278,13 @@ def main():
     content = plan_path.read_text(encoding="utf-8", errors="replace")
     tasks = parse_tasks_from_markdown(content)
     is_valid, errors, warnings = validate_dag(tasks)
-    waves = compute_execution_waves(tasks) if is_valid else []
+    waves = []
+    if is_valid:
+        try:
+            waves = compute_execution_waves(tasks)
+        except ValueError as e:
+            is_valid = False
+            errors = [str(e)]
 
     if args.json:
         result = {

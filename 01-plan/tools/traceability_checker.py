@@ -14,7 +14,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, List, Any, Set
+from typing import Dict, List, Any, Optional, Set
 
 PLAN_DIR = Path(__file__).resolve().parent.parent
 SPEC_DIR = PLAN_DIR / "spec"
@@ -122,6 +122,7 @@ def generate_matrix_markdown(requirements: Dict[str, Dict[str, Any]]) -> str:
         f"| **Overall Complete Traceability** | **{full_count} / {total_reqs}** | **{pct:.0f}%** |",
         "",
         "> Verified coverage is machine-checked: `python3 tools/traceability_checker.py --strict`",
+        "> (read-only check; pass `--update-matrix` to regenerate this file)",
         "",
         "---",
         "",
@@ -141,12 +142,18 @@ def generate_matrix_markdown(requirements: Dict[str, Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Traceability Checker for 01-plan")
     parser.add_argument("--strict", action="store_true", help="Exit 1 if any gaps exist")
-    parser.add_argument("--update-matrix", action="store_true", default=True, help="Update TRACEABILITY_MATRIX.md")
+    parser.add_argument("--update-matrix", action="store_true", default=False,
+                        help="Regenerate TRACEABILITY_MATRIX.md (check is read-only by default)")
     parser.add_argument("--json", action="store_true", help="Output JSON report")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: Optional[List[str]] = None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     reqs = parse_spec_requirements(SPEC_DIR)
     scan_code_annotations(reqs, [TOOLS_DIR, WORKFLOWS_DIR, TEMPLATES_DIR, TESTS_DIR])

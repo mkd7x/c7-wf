@@ -23,6 +23,39 @@ from typing import Dict, List, Any, Optional
 
 DEFAULT_RUNS_DIR = Path(__file__).resolve().parent.parent / "runs" / "latest"
 
+# Directories never descended into during scans (dependency caches, VCS, build output)
+EXCLUDED_DIRS = frozenset({
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    ".tox", "dist", "build", "target", ".idea", ".vscode",
+})
+# Individual files larger than this are skipped during route scanning
+MAX_SCAN_FILE_BYTES = 1_000_000
+
+
+def _is_excluded(path: Path, root: Path) -> bool:
+    """True if any path component relative to root is an excluded directory."""
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel_parts = path.parts
+    return any(part in EXCLUDED_DIRS for part in rel_parts)
+
+
+def _walk_files(root: Path):
+    """Yield files under root, pruning excluded directories (no dependency-cache walks)."""
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+        for name in filenames:
+            yield Path(dirpath) / name
+
+
+def _walk_dirs(root: Path):
+    """Yield directories under root, pruning excluded directories."""
+    for dirpath, dirnames, _ in os.walk(root, topdown=True):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS]
+        for d in dirnames:
+            yield Path(dirpath) / d
+
 
 def detect_manifests(root: Path) -> Dict[str, Any]:
     """
@@ -71,9 +104,14 @@ def detect_manifests(root: Path) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # .NET / C#
-    csproj_files = list(root.glob("**/*.csproj"))
-    sln_files = list(root.glob("**/*.sln"))
+    # .NET / C# (walk with excluded-dir pruning so dependency caches are skipped)
+    csproj_files = []
+    sln_files = []
+    for p in _walk_files(root):
+        if p.suffix.lower() == ".csproj":
+            csproj_files.append(p)
+        elif p.suffix.lower() == ".sln":
+            sln_files.append(p)
     if csproj_files or sln_files:
         language = "csharp"
         manifests["dotnet"] = {
@@ -129,8 +167,8 @@ def detect_boundaries_and_adrs(root: Path) -> Dict[str, Any]:
     """
     clean_arch_layers = []
     layer_names = ["domain", "application", "infrastructure", "api", "web", "services", "controllers", "models", "core"]
-    for item in root.glob("**/*"):
-        if item.is_dir() and item.name.lower() in layer_names and ".git" not in item.parts:
+    for item in _walk_dirs(root):
+        if item.name.lower() in layer_names and not _is_excluded(item, root):
             clean_arch_layers.append(str(item.relative_to(root)))
 
     # Detect existing ADRs
@@ -161,17 +199,19 @@ def detect_routes_and_schemas(root: Path) -> Dict[str, Any]:
         re.compile(r"\[Http(Get|Post|Put|Delete|Patch)(?:\(['\"]([^'\"]*)['\"])?\]", re.IGNORECASE)
     ]
 
-    for p in root.glob("**/*"):
-        if not p.is_file() or ".git" in p.parts or "node_modules" in p.parts or ".venv" in p.parts:
+    for p in _walk_files(root):
+        if not p.is_file() or _is_excluded(p, root):
             continue
 
         # Schemas
         if p.suffix.lower() in [".sql", ".prisma"] or "migration" in p.name.lower():
             schemas.append(str(p.relative_to(root)))
 
-        # Routes in code files
+        # Routes in code files (skip oversized files to bound memory/time)
         if p.suffix.lower() in [".py", ".ts", ".js", ".cs", ".go"]:
             try:
+                if p.stat().st_size > MAX_SCAN_FILE_BYTES:
+                    continue
                 content = p.read_text(encoding="utf-8", errors="replace")
                 for pat in route_patterns:
                     matches = pat.findall(content)

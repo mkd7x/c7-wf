@@ -153,19 +153,27 @@ def package_plan(title: str, workflow_mode: str, source_ref: str,
             }
         ]
 
+    # Reject invalid task graphs before packaging (fail loudly, never emit partial waves)
+    dag_valid, dag_errors, _ = task_graph.validate_dag(tasks)
+    if not dag_valid:
+        raise ValueError(f"Cannot package plan: invalid task DAG: {'; '.join(dag_errors)}")
+
     # Compute execution waves
     waves = task_graph.compute_execution_waves(tasks)
     waves_summary = task_graph.generate_waves_markdown(waves)
+    wave_positions = {t["id"]: idx + 1 for idx, wave in enumerate(waves) for t in wave}
 
     # Render task specifications
     task_specs = []
     for t in tasks:
+        wave_num = wave_positions.get(t["id"], t.get("wave", 1))
+        t["wave"] = wave_num
         files_str = "\n".join([f"  - `{f}`" for f in t.get("files", [])])
         dod_str = "\n".join([f"- [ ] {d}" for d in t.get("dod", [])])
         qa_action = t.get("qa_criteria", {}).get("action", "Verification check")
         qa_expect = t.get("qa_criteria", {}).get("expected_outcome", "Pass")
         spec = f"""### [{t['id']}] {t['title']}
-- **Wave**: {t.get('wave', 1)}
+- **Wave**: {wave_num}
 - **Dependencies**: `{json.dumps(t.get('dependencies', []))}`
 - **Component / Layer**: {t.get('component', 'General')}
 - **Files to Touch**:
@@ -226,15 +234,27 @@ Implementation for {t['title']}.
     return plan_path
 
 
-def commit_plan_to_git(plan_file: Path, branch: Optional[str] = None, push: bool = False) -> Dict[str, Any]:
+def commit_plan_to_git(plan_file: Path, branch: Optional[str] = None, push: bool = False,
+                       skip_validation: bool = False) -> Dict[str, Any]:
     """
     Commit the execution plan to Git and inject commit provenance into the header.
+    The plan is validated (strict schema lint + DAG validation) BEFORE any file
+    mutation or git operation. Invalid plans raise ValueError and are never
+    marked READY FOR 02-EXE (per SPEC-PLAN-005 AC3).
     @implements REQ-HAND-01
     @implements REQ-HAND-02
     """
     plan_file = Path(plan_file).resolve()
     if not plan_file.exists():
         raise FileNotFoundError(f"Plan file not found: {plan_file}")
+
+    if not skip_validation:
+        valid, errors, _ = plan_validator.lint_plan(plan_file, strict=True)
+        if not valid:
+            raise ValueError(
+                f"Cannot commit plan: validation failed with {len(errors)} error(s): "
+                + "; ".join(errors)
+            )
 
     content = plan_file.read_text(encoding="utf-8")
 
@@ -297,42 +317,78 @@ def commit_plan_to_git(plan_file: Path, branch: Optional[str] = None, push: bool
     return result
 
 
-def get_latest_plan(ticket: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Machine query interface for 02-exe to pull the active committed plan.
-    @implements REQ-HAND-03
-    """
-    plans = sorted(PLANS_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not plans:
-        return {"status": "NO_PLANS_FOUND"}
-
-    matched_plan = plans[0]
-    if ticket:
-        ticket_lower = ticket.lower()
-        for p in plans:
-            if ticket_lower in p.name.lower():
-                matched_plan = p
-                break
-
-    content = matched_plan.read_text(encoding="utf-8", errors="replace")
+def _plan_readiness(plan_path: Path) -> Tuple[Dict[str, Any], List[str]]:
+    """Return (plan payload, blocking reasons). Empty reasons means READY for 02-exe."""
+    reasons: List[str] = []
+    content = plan_path.read_text(encoding="utf-8", errors="replace")
     tasks = task_graph.parse_tasks_from_markdown(content)
-    waves = task_graph.compute_execution_waves(tasks)
+    try:
+        waves = task_graph.compute_execution_waves(tasks)
+    except ValueError as e:
+        waves = []
+        reasons.append(str(e))
 
     # Extract commit SHA and branch from header
     sha_match = re.search(r"\|\s*\*\*Git Commit SHA\*\*\s*\|\s*`?([A-Za-z0-9_-]+)`?\s*\|", content)
     branch_match = re.search(r"\|\s*\*\*Target Branch\*\*\s*\|\s*`?([^`|\n]+)`?\s*\|", content)
     status_match = re.search(r"\|\s*\*\*Overall Status\*\*\s*\|\s*(.+)\|", content)
 
-    return {
-        "plan_file": str(matched_plan),
-        "commit_sha": sha_match.group(1).strip() if sha_match else "UNKNOWN",
+    commit_sha = sha_match.group(1).strip() if sha_match else "UNKNOWN"
+    overall_status = status_match.group(1).strip() if status_match else "UNKNOWN"
+
+    if "READY FOR 02-EXE" not in overall_status:
+        reasons.append(
+            f"Plan status is '{overall_status}', not 'READY FOR 02-EXE'. "
+            "Commit the plan via 'commit-plan' before handoff to 02-exe."
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        reasons.append(
+            f"Plan has no valid 40-character Git commit SHA (found '{commit_sha}')."
+        )
+
+    payload = {
+        "plan_file": str(plan_path),
+        "commit_sha": commit_sha,
         "target_branch": branch_match.group(1).strip() if branch_match else "main",
-        "overall_status": status_match.group(1).strip() if status_match else "UNKNOWN",
+        "overall_status": overall_status,
         "task_count": len(tasks),
         "waves_count": len(waves),
         "tasks": tasks,
-        "waves": [[t["id"] for t in w] for w in waves]
+        "waves": [[t["id"] for t in w] for w in waves],
     }
+    return payload, reasons
+
+
+def get_latest_plan(ticket: Optional[str] = None, require_ready: bool = True) -> Dict[str, Any]:
+    """
+    Machine query interface for 02-exe to pull the active committed plan.
+    By default only plans with status READY FOR 02-EXE and a valid 40-char
+    Git SHA are returned; otherwise a PLAN_NOT_READY payload is returned and
+    02-exe must refuse to start. Pass require_ready=False for inspection only.
+    @implements REQ-HAND-03
+    """
+    plans = sorted(PLANS_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if ticket:
+        ticket_lower = ticket.lower()
+        matched = [p for p in plans if ticket_lower in p.name.lower()]
+        if not matched:
+            return {"status": "TICKET_NOT_FOUND", "ticket": ticket}
+        candidates = matched
+    else:
+        if not plans:
+            return {"status": "NO_PLANS_FOUND"}
+        candidates = plans
+
+    for plan_path in candidates:
+        payload, reasons = _plan_readiness(plan_path)
+        if not reasons:
+            return payload
+        if not require_ready:
+            return {**payload, "status": "PLAN_NOT_READY", "reasons": reasons}
+
+    # No READY plan among candidates: report the newest one's blockers
+    payload, reasons = _plan_readiness(candidates[0])
+    return {**payload, "status": "PLAN_NOT_READY", "reasons": reasons}
 
 
 def main():
@@ -389,12 +445,16 @@ def main():
     cp_p.add_argument("--file", required=True, help="Path to plan file")
     cp_p.add_argument("--branch", help="Target git branch name")
     cp_p.add_argument("--push", action="store_true", help="Push commit to git remote")
+    cp_p.add_argument("--skip-validation", action="store_true",
+                      help="Skip pre-commit validation (NOT recommended; for recovery only)")
     cp_p.add_argument("--step-id", help="Audit step identifier")
 
     # get-latest-plan
     gl_p = subparsers.add_parser("get-latest-plan", help="Retrieve active plan for 02-exe")
     gl_p.add_argument("--ticket", help="Filter by Jira ticket")
     gl_p.add_argument("--json", action="store_true", help="Print json output")
+    gl_p.add_argument("--allow-not-ready", action="store_true",
+                      help="Return newest plan even if not READY (inspection only; 02-exe must not execute it)")
 
     # lint-workflow
     lw_p = subparsers.add_parser("lint-workflow", help="Lint a workflow runbook")
@@ -443,12 +503,27 @@ def main():
             print("\n" + task_graph.generate_waves_markdown(waves))
 
     elif args.action == "sync-jira":
+        plan_path = Path(args.file)
+        if not plan_path.exists():
+            print(f"[!] Plan file not found: {plan_path}", file=sys.stderr)
+            sys.exit(1)
         client = jira_client.JiraClient(dry_run=args.dry_run)
-        plan_content = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        plan_content = plan_path.read_text(encoding="utf-8", errors="replace")
         tasks = task_graph.parse_tasks_from_markdown(plan_content)
 
-        # Post comment
-        comment = f"Plan registered from {Path(args.file).name} with {len(tasks)} decomposed tasks."
+        # Extract plan metadata for the templated comment
+        plan_id_m = re.search(r"\|\s*\*\*Plan ID\*\*\s*\|\s*`?([^`|\n]+)`?\s*\|", plan_content)
+        title_m = re.search(r"^#\s+Execution Plan:\s*(.+)$", plan_content, re.MULTILINE)
+        branch_m = re.search(r"\|\s*\*\*Target Branch\*\*\s*\|\s*`?([^`|\n]+)`?\s*\|", plan_content)
+        sha_m = re.search(r"\|\s*\*\*Git Commit SHA\*\*\s*\|\s*`?([A-Za-z0-9_-]+)`?\s*\|", plan_content)
+        comment = jira_client.render_plan_comment(
+            plan_id=plan_id_m.group(1).strip() if plan_id_m else "PLAN-UNKNOWN",
+            plan_title=title_m.group(1).strip() if title_m else plan_path.stem,
+            plan_file=plan_path.name,
+            target_branch=branch_m.group(1).strip() if branch_m else "main",
+            commit_sha=sha_m.group(1).strip() if sha_m else "UNCOMMITTED",
+            tasks=tasks,
+        )
         client.post_comment(args.ticket, comment)
 
         # Transition
@@ -468,13 +543,30 @@ def main():
         print(f"[✓] Execution Plan packaged: {plan_p}")
 
     elif args.action == "commit-plan":
-        res = commit_plan_to_git(Path(args.file), branch=args.branch, push=args.push)
+        try:
+            res = commit_plan_to_git(Path(args.file), branch=args.branch, push=args.push,
+                                     skip_validation=args.skip_validation)
+        except ValueError as e:
+            print(f"[!] {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"[✓] Plan committed to Git:")
         print(f"    Commit SHA: {res['commit_sha']}")
         print(f"    Status:     {res['status']}")
 
     elif args.action == "get-latest-plan":
-        res = get_latest_plan(ticket=args.ticket)
+        res = get_latest_plan(ticket=args.ticket, require_ready=not args.allow_not_ready)
+        if res.get("status") in ("PLAN_NOT_READY", "NO_PLANS_FOUND", "TICKET_NOT_FOUND"):
+            if res.get("status") == "NO_PLANS_FOUND":
+                print("[!] No plans found in plans/. Package a plan first.", file=sys.stderr)
+            elif res.get("status") == "TICKET_NOT_FOUND":
+                print(f"[!] No plan found matching ticket '{args.ticket}'.", file=sys.stderr)
+            else:
+                print("[!] No READY plan available for 02-exe:", file=sys.stderr)
+                for reason in res.get("reasons", []):
+                    print(f"    - {reason}", file=sys.stderr)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            sys.exit(2)
         if args.json:
             print(json.dumps(res, indent=2))
         else:

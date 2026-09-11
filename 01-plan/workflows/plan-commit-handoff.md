@@ -36,6 +36,8 @@ python3 tools/plan_runner.py commit-plan \
   --branch feature/<BRANCH_NAME> \
   --step-id step-02-commit-plan
 ```
+`commit-plan` enforces pre-commit validation (strict schema lint + DAG validation) and refuses to
+mark invalid plans `READY FOR 02-EXE`. Bypass only for recovery with `--skip-validation`.
 
 ### Step 3: Handoff Verification Gate
 Confirm that `02-exe` can read the plan through its standard query interface:
@@ -47,3 +49,5 @@ Verify that the output contains:
 - `commit_sha`: valid 40-character Git hash
 - `status`: `READY FOR 02-EXE`
 - `waves`: computed execution waves
+- no `status: PLAN_NOT_READY` (exit code 2 means no READY plan exists; `02-exe` must refuse to start).
+  Use `--allow-not-ready` for inspection only.

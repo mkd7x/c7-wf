@@ -23,7 +23,13 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import task_graph
+
 DEFAULT_RUNS_DIR = Path(__file__).resolve().parent.parent / "runs" / "latest"
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+COMMENT_TEMPLATE_FILE = TEMPLATES_DIR / "JIRA_COMMENT_TEMPLATE.md"
 
 
 class JiraClient:
@@ -187,31 +193,97 @@ class JiraClient:
             print(f"[WARN] Failed to transition issue {ticket_key}: {e}")
             return {"key": ticket_key, "error": str(e), "status": "FAILED"}
 
+    def _post_json(self, url: str, payload: Dict[str, Any]) -> Tuple[bool, Any]:
+        """POST a JSON payload; return (ok, parsed response or error string)."""
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=self._get_headers(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8")
+                try:
+                    return True, json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    return True, {}
+        except Exception as e:
+            err_msg = str(e)
+            if hasattr(e, "read"):
+                try:
+                    raw_body = e.read().decode("utf-8", errors="replace")
+                    if raw_body:
+                        try:
+                            parsed_body = json.loads(raw_body)
+                            msgs = parsed_body.get("errorMessages", [])
+                            field_errs = parsed_body.get("errors", {})
+                            parts = []
+                            if msgs:
+                                parts.extend(msgs)
+                            if field_errs:
+                                parts.extend([f"{k}: {v}" for k, v in field_errs.items()])
+                            if parts:
+                                err_msg = f"{e}: {'; '.join(parts)}"
+                            else:
+                                err_msg = f"{e}: {raw_body}"
+                        except json.JSONDecodeError:
+                            err_msg = f"{e}: {raw_body}"
+                except Exception:
+                    pass
+                finally:
+                    if hasattr(e, "close"):
+                        try:
+                            e.close()
+                        except Exception:
+                            pass
+            return False, err_msg
+
     def create_subtasks(self, parent_key: str, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Create Jira subtasks for planned tasks.
+        Create Jira subtasks for planned tasks via POST /rest/api/2/issue.
+        Each subtask payload sets parent, project, summary, description, and
+        issuetype Sub-task. Failures are recorded per-subtask with status FAILED
+        instead of fabricating keys; dry-run returns deterministic mock keys.
         @implements REQ-WORK-03
         """
         created = []
+        parent_key = parent_key.upper().strip()
         project_key = parent_key.split("-")[0] if "-" in parent_key else "PROJ"
 
         for idx, task in enumerate(tasks, 1):
+            summary = f"[{task.get('id', f'TASK-{idx}')}] {task.get('title', 'Untitled task')}"
             if self.dry_run:
-                subtask_key = f"{project_key}-{1000 + idx}"
                 created.append({
-                    "subtask_key": subtask_key,
+                    "subtask_key": f"{project_key}-{1000 + idx}",
                     "parent_key": parent_key,
-                    "summary": f"[{task['id']}] {task['title']}",
-                    "is_mock": True
+                    "summary": summary,
+                    "is_mock": True,
+                    "status": "CREATED_MOCK",
+                })
+                continue
+            payload = {
+                "fields": {
+                    "project": {"key": project_key},
+                    "parent": {"key": parent_key},
+                    "summary": summary[:255],
+                    "description": task.get("title", ""),
+                    "issuetype": {"name": "Sub-task"},
+                }
+            }
+            ok, data = self._post_json(f"{self.base_url}/rest/api/2/issue", payload)
+            if ok:
+                created.append({
+                    "subtask_key": data.get("key", f"{project_key}-UNKNOWN"),
+                    "parent_key": parent_key,
+                    "summary": summary,
+                    "is_mock": False,
+                    "status": "CREATED",
                 })
             else:
-                # Real API subtask creation omitted for standard payload; can post to /rest/api/2/issue
-                subtask_key = f"{project_key}-{1000 + idx}"
                 created.append({
-                    "subtask_key": subtask_key,
+                    "subtask_key": None,
                     "parent_key": parent_key,
-                    "summary": f"[{task['id']}] {task['title']}",
-                    "is_mock": False
+                    "summary": summary,
+                    "is_mock": False,
+                    "status": "FAILED",
+                    "error": data,
                 })
 
         self._record_sync("create_subtasks", parent_key, {"subtasks": created})
@@ -233,11 +305,64 @@ class JiraClient:
             pass
 
 
+def render_plan_comment(plan_id: str, plan_title: str, plan_file: str,
+                       target_branch: str, commit_sha: str,
+                       tasks: List[Dict[str, Any]]) -> str:
+    """
+    Render JIRA_COMMENT_TEMPLATE.md for a packaged plan.
+    Includes a wave-scheduled task summary table and the QA scenario count.
+    Falls back to a plain-text summary if the template file is missing.
+    @implements REQ-WORK-03
+    """
+    qa_count = sum(1 for t in tasks if t.get("qa_criteria"))
+    try:
+        waves = task_graph.compute_execution_waves(tasks)
+        wave_lines = task_graph.generate_waves_markdown(waves).splitlines()
+    except ValueError:
+        wave_lines = []
+    summary_rows = [
+        "| Wave # | Task ID | Title | Dependencies |",
+        "| :--- | :--- | :--- | :--- |",
+    ]
+    for line in wave_lines[2:]:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        # wave table columns: Wave #, Task ID, Title, Component, Dependencies
+        if len(cells) >= 5:
+            summary_rows.append(
+                f"| {cells[0]} | {cells[1]} | {cells[2]} | {cells[4]} |"
+            )
+        else:
+            summary_rows.append(line)
+    if len(summary_rows) == 2:
+        summary_rows.append("| — | *No tasks scheduled* | — | — |")
+    replacements = {
+        "{{PLAN_ID}}": plan_id,
+        "{{PLAN_TITLE}}": plan_title,
+        "{{PLAN_FILE_PATH}}": plan_file,
+        "{{TARGET_BRANCH}}": target_branch,
+        "{{COMMIT_SHA}}": commit_sha,
+        "{{TASK_SUMMARY_TABLE}}": "\n".join(summary_rows),
+        "{{TOTAL_QA_SCENARIOS}}": str(qa_count),
+    }
+    try:
+        template = COMMENT_TEMPLATE_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            f"Execution plan {plan_id} ({plan_title}) ready: "
+            f"{len(tasks)} tasks, {qa_count} QA scenarios. "
+            f"Branch {target_branch}, commit {commit_sha}."
+        )
+    for key, value in replacements.items():
+        template = template.replace(key, value)
+    return template
+
+
 def main():
     parser = argparse.ArgumentParser(description="Jira Integration Client")
     parser.add_argument("action", choices=["fetch", "comment", "transition", "subtasks"], help="Action to perform")
     parser.add_argument("--ticket", required=True, help="Jira ticket key (e.g. PROJ-1024)")
     parser.add_argument("--text", help="Comment text or status name")
+    parser.add_argument("--file", help="Path to plan markdown (used with 'subtasks' to load real tasks)")
     parser.add_argument("--dry-run", action="store_true", help="Force offline / dry-run mode")
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     args = parser.parse_args()
@@ -264,6 +389,35 @@ def main():
     elif args.action == "transition":
         res = client.transition_issue(args.ticket, args.text or "In Progress")
         print(json.dumps(res, indent=2))
+
+    elif args.action == "subtasks":
+        tasks: List[Dict[str, Any]] = []
+        if args.file:
+            plan_path = Path(args.file)
+            if not plan_path.exists():
+                print(f"[!] Plan file not found: {plan_path}", file=sys.stderr)
+                sys.exit(1)
+            tasks = task_graph.parse_tasks_from_markdown(
+                plan_path.read_text(encoding="utf-8", errors="replace")
+            )
+            if not tasks:
+                print(f"[!] No tasks parsed from {plan_path}", file=sys.stderr)
+                sys.exit(1)
+        elif args.text:
+            try:
+                raw = json.loads(args.text)
+                tasks = raw if isinstance(raw, list) else raw.get("tasks", [])
+            except json.JSONDecodeError as e:
+                print(f"[!] --text must be a JSON task list: {e}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("[!] 'subtasks' requires --file <plan.md> or --text '<JSON task list>'",
+                  file=sys.stderr)
+            sys.exit(1)
+        res = client.create_subtasks(args.ticket, tasks)
+        print(json.dumps(res, indent=2))
+        if any(s.get("status") == "FAILED" for s in res):
+            sys.exit(1)
 
 
 if __name__ == "__main__":
